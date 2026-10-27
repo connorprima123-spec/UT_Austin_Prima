@@ -24,6 +24,20 @@ class MLPPlanner(nn.Module):
         self.n_track = n_track
         self.n_waypoints = n_waypoints
 
+        in_dim = 2 * n_track * 2  # left + right, (x, y) each
+        hidden = 256
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden // 2),
+            nn.GELU(),
+            nn.Linear(hidden // 2, n_waypoints * 2),
+        )
+
     def forward(
         self,
         track_left: torch.Tensor,
@@ -43,7 +57,10 @@ class MLPPlanner(nn.Module):
         Returns:
             torch.Tensor: future waypoints with shape (b, n_waypoints, 2)
         """
-        raise NotImplementedError
+        b = track_left.shape[0]
+        x = torch.cat([track_left, track_right], dim=1)  # (b, 2*n_track, 2)
+        x = x.reshape(b, -1)
+        return self.net(x).reshape(b, self.n_waypoints, 2)
 
 
 class TransformerPlanner(nn.Module):
@@ -60,6 +77,24 @@ class TransformerPlanner(nn.Module):
 
         self.query_embed = nn.Embedding(n_waypoints, d_model)
 
+        # encode each boundary point; learned positional embedding distinguishes
+        # left/right and the order along the track
+        self.input_proj = nn.Linear(2, d_model)
+        self.pos_embed = nn.Embedding(2 * n_track, d_model)
+
+        # Perceiver-style: waypoint queries cross-attend to the track points
+        layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=4,
+            dim_feedforward=4 * d_model,
+            dropout=0.0,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.decoder = nn.TransformerDecoder(layer, num_layers=3)
+        self.norm = nn.LayerNorm(d_model)
+        self.out_proj = nn.Linear(d_model, 2)
+
     def forward(
         self,
         track_left: torch.Tensor,
@@ -79,7 +114,14 @@ class TransformerPlanner(nn.Module):
         Returns:
             torch.Tensor: future waypoints with shape (b, n_waypoints, 2)
         """
-        raise NotImplementedError
+        b = track_left.shape[0]
+        pts = torch.cat([track_left, track_right], dim=1)  # (b, 2*n_track, 2)
+        pos = self.pos_embed(torch.arange(pts.shape[1], device=pts.device))
+        memory = self.input_proj(pts) + pos[None]  # (b, 2*n_track, d)
+
+        queries = self.query_embed.weight[None].expand(b, -1, -1)  # (b, n_waypoints, d)
+        out = self.decoder(queries, memory)
+        return self.out_proj(self.norm(out))  # (b, n_waypoints, 2)
 
 
 class CNNPlanner(torch.nn.Module):
@@ -94,6 +136,32 @@ class CNNPlanner(torch.nn.Module):
         self.register_buffer("input_mean", torch.as_tensor(INPUT_MEAN), persistent=False)
         self.register_buffer("input_std", torch.as_tensor(INPUT_STD), persistent=False)
 
+        def block(c_in, c_out):
+            return nn.Sequential(
+                nn.Conv2d(c_in, c_out, 3, stride=2, padding=1, bias=False),
+                nn.BatchNorm2d(c_out),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(c_out, c_out, 3, padding=1, bias=False),
+                nn.BatchNorm2d(c_out),
+                nn.ReLU(inplace=True),
+            )
+
+        # (3, 96, 128) -> (128, 6, 8)
+        self.backbone = nn.Sequential(
+            block(3, 32),
+            block(32, 64),
+            block(64, 96),
+            block(96, 128),
+            nn.AdaptiveAvgPool2d((6, 8)),  # keep coarse spatial layout
+        )
+        self.head = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128 * 6 * 8, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
+            nn.Linear(256, n_waypoints * 2),
+        )
+
     def forward(self, image: torch.Tensor, **kwargs) -> torch.Tensor:
         """
         Args:
@@ -105,7 +173,8 @@ class CNNPlanner(torch.nn.Module):
         x = image
         x = (x - self.input_mean[None, :, None, None]) / self.input_std[None, :, None, None]
 
-        raise NotImplementedError
+        x = self.backbone(x)
+        return self.head(x).reshape(-1, self.n_waypoints, 2)
 
 
 MODEL_FACTORY = {
